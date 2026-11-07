@@ -123,6 +123,61 @@ app.post("/run", authenticate, async (req, res) => {
   }
 });
 
+
+
+app.post("/setup-login", authenticate, async (req, res) => {
+  try {
+    const contextId = process.env.BROWSERBASE_CONTEXT_ID;
+
+    if (!contextId) {
+      return res.status(400).json({
+        success: false,
+        message: "BROWSERBASE_CONTEXT_ID is missing"
+      });
+    }
+
+    const session = await bb.sessions.create({
+      browserSettings: {
+        context: {
+          id: contextId,
+          persist: true
+        }
+      }
+    });
+
+    const browser = await chromium.connectOverCDP(
+      session.connectUrl
+    );
+
+    const context = browser.contexts()[0];
+    const page = context.pages()[0] || await context.newPage();
+
+    await page.goto("https://claude.ai", {
+      waitUntil: "domcontentloaded"
+    });
+
+    return res.json({
+      success: true,
+      message: "Claude login session is ready",
+      sessionId: session.id,
+      loginUrl: "https://claude.ai",
+      sessionInspector:
+        `https://browserbase.com/sessions/${session.id}`,
+      instruction:
+        "Open the session in Browserbase and log in manually."
+    });
+
+  } catch (error) {
+    console.error(error);
+
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
