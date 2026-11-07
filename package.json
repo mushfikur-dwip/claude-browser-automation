@@ -2,7 +2,7 @@
 {
   "name": "claude-browser-automation",
   "version": "1.0.0",
-  "description": "Browserbase automation API for n8n",
+  "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
