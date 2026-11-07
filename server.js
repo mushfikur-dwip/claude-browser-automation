@@ -4,7 +4,6 @@ import Browserbase from "@browserbasehq/sdk";
 import { chromium } from "playwright-core";
 
 const app = express();
-
 app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 3000;
@@ -17,8 +16,7 @@ const {
   CLAUDE_PROJECT_URL
 } = process.env;
 
-// Validate environment variables
-const requiredVariables = {
+const required = {
   BROWSERBASE_API_KEY,
   BROWSERBASE_PROJECT_ID,
   BROWSERBASE_CONTEXT_ID,
@@ -26,36 +24,23 @@ const requiredVariables = {
   CLAUDE_PROJECT_URL
 };
 
-const missingVariables = Object.entries(requiredVariables)
+const missing = Object.entries(required)
   .filter(([, value]) => !value)
   .map(([key]) => key);
 
-if (missingVariables.length > 0) {
-  throw new Error(
-    `Missing environment variables: ${missingVariables.join(", ")}`
-  );
+if (missing.length) {
+  throw new Error(`Missing environment variables: ${missing.join(", ")}`);
 }
 
-// Validate Claude Project URL
-const projectUrl = new URL(CLAUDE_PROJECT_URL);
-
-if (
-  projectUrl.hostname !== "claude.ai" ||
-  !projectUrl.pathname.startsWith("/project/")
-) {
-  throw new Error("Invalid Claude Project URL");
-}
-
-// Browserbase client
 const bb = new Browserbase({
   apiKey: BROWSERBASE_API_KEY
 });
 
-// Authentication middleware
 function authenticate(req, res, next) {
-  const token = req.headers.authorization;
-
-  if (token !== `Bearer ${AUTOMATION_API_KEY}`) {
+  if (
+    req.headers.authorization !==
+    `Bearer ${AUTOMATION_API_KEY}`
+  ) {
     return res.status(401).json({
       success: false,
       message: "Unauthorized"
@@ -65,22 +50,11 @@ function authenticate(req, res, next) {
   next();
 }
 
-// Health check
-app.get("/health", (req, res) => {
-  res.json({
-    success: true,
-    service: "Claude Browser Automation",
-    status: "online",
-    projectConfigured: true,
-    contextConfigured: true
-  });
-});
-
-// Create Browserbase session with saved Context
-async function createBrowserSession() {
-  return await bb.sessions.create({
+async function createSession() {
+  return bb.sessions.create({
     projectId: BROWSERBASE_PROJECT_ID,
     region: "us-west-2",
+    api_timeout: 1200,
     browserSettings: {
       context: {
         id: BROWSERBASE_CONTEXT_ID,
@@ -90,7 +64,6 @@ async function createBrowserSession() {
   });
 }
 
-// Release Browserbase session
 async function releaseSession(sessionId) {
   if (!sessionId) return;
 
@@ -99,198 +72,306 @@ async function releaseSession(sessionId) {
       status: "REQUEST_RELEASE",
       projectId: BROWSERBASE_PROJECT_ID
     });
-
-    console.log(`Session release requested: ${sessionId}`);
   } catch (error) {
     console.error("Session release error:", error.message);
   }
 }
 
-// Check Claude login status
-async function inspectClaudeProject(page) {
-  const currentUrl = page.url();
-  const title = await page.title();
+async function findComposer(page) {
+  const selectors = [
+    '[contenteditable="true"]',
+    'textarea',
+    '[role="textbox"]'
+  ];
 
-  const loginRequired =
-    currentUrl.includes("/login") ||
-    currentUrl.includes("/oauth") ||
-    currentUrl.includes("/auth/");
+  for (const selector of selectors) {
+    const locator = page.locator(selector).last();
 
-  const projectOpened =
-    currentUrl.includes("/project/") &&
-    !loginRequired;
+    try {
+      await locator.waitFor({
+        state: "visible",
+        timeout: 5000
+      });
 
-  return {
-    projectOpened,
-    loginRequired,
-    browserTitle: title,
-    currentUrl
-  };
+      return locator;
+    } catch {
+      // Try the next selector.
+    }
+  }
+
+  throw new Error(
+    "Claude chat input not found. Inspect the page DOM and update selectors."
+  );
 }
 
-// Main automation endpoint
+async function submitPrompt(page, prompt) {
+  const composer = await findComposer(page);
+
+  await composer.click();
+  await composer.fill(prompt);
+
+  const sendButtons = [
+    'button[aria-label*="Send" i]',
+    'button[data-testid*="send"]',
+    'button[aria-label*="Submit" i]'
+  ];
+
+  let sent = false;
+
+  for (const selector of sendButtons) {
+    const button = page.locator(selector).last();
+
+    if (await button.count()) {
+      try {
+        if (await button.isVisible() && await button.isEnabled()) {
+          await button.click();
+          sent = true;
+          break;
+        }
+      } catch {
+        // Try keyboard submission.
+      }
+    }
+  }
+
+  if (!sent) {
+    await composer.press("Enter");
+  }
+
+  await page.waitForTimeout(3000);
+}
+
+async function getMainText(page) {
+  const main = page.locator("main").last();
+
+  if (await main.count()) {
+    return (await main.innerText()).trim();
+  }
+
+  return (await page.locator("body").innerText()).trim();
+}
+
+async function waitForClaudeResponse(page, timeoutMs = 900000) {
+  const startedAt = Date.now();
+
+  let previousText = "";
+  let stableSince = 0;
+  let lastText = "";
+
+  while (Date.now() - startedAt < timeoutMs) {
+    await page.waitForTimeout(2000);
+
+    const currentText = await getMainText(page);
+
+    const stopButton = page.locator(
+      'button[aria-label*="Stop" i], button[title*="Stop" i]'
+    ).last();
+
+    let isGenerating = false;
+
+    try {
+      isGenerating =
+        (await stopButton.count()) > 0 &&
+        await stopButton.isVisible();
+    } catch {
+      isGenerating = false;
+    }
+
+    if (currentText.length > 500) {
+      lastText = currentText;
+
+      if (currentText === previousText && !isGenerating) {
+        if (!stableSince) stableSince = Date.now();
+
+        // Wait for response to remain stable for 10 seconds.
+        if (Date.now() - stableSince >= 10000) {
+          return lastText;
+        }
+      } else {
+        stableSince = 0;
+      }
+    }
+
+    previousText = currentText;
+  }
+
+  throw new Error(
+    "Claude response timed out. Check the Browserbase session."
+  );
+}
+
+// Health check
+app.get("/health", (req, res) => {
+  res.json({
+    success: true,
+    service: "Claude Script Automation",
+    status: "online"
+  });
+});
+
+// Generate script from a topic
 app.post("/run", authenticate, async (req, res) => {
   let session;
-  let responseData;
 
   try {
-    const { title } = req.body;
+    const title = String(req.body.title || "").trim();
 
-    if (!title || typeof title !== "string" || !title.trim()) {
+    if (!title) {
       return res.status(400).json({
         success: false,
-        message: "A valid topic title is required"
+        message: "Topic title is required"
       });
     }
 
-    console.log(`Starting automation for: ${title}`);
+    console.log("Starting topic:", title);
 
-    // Create Browserbase session
-    session = await createBrowserSession();
+    session = await createSession();
 
-    console.log(`Browserbase session created: ${session.id}`);
-
-    // Connect Playwright
     const browser = await chromium.connectOverCDP(
       session.connectUrl
     );
 
     const context = browser.contexts()[0];
+    const page = context.pages()[0] || await context.newPage();
 
-    const page =
-      context.pages()[0] || await context.newPage();
-
-    // Open the configured Claude Project
     await page.goto(CLAUDE_PROJECT_URL, {
       waitUntil: "domcontentloaded",
       timeout: 90000
     });
 
-    // Wait for initial page rendering
     await page.waitForTimeout(7000);
 
-    // Inspect current state
-    const inspection = await inspectClaudeProject(page);
+    const currentUrl = page.url();
 
-    console.log("Claude inspection:", inspection);
+    if (
+      currentUrl.includes("/login") ||
+      currentUrl.includes("/oauth")
+    ) {
+      throw new Error(
+        "Claude login required. Re-authenticate the Browserbase Context."
+      );
+    }
 
-    responseData = {
-      success: inspection.projectOpened,
-      message: inspection.projectOpened
-        ? "Claude Project opened successfully"
-        : inspection.loginRequired
-          ? "Claude login is required"
-          : "Claude Project could not be verified",
-      topic: title.trim(),
-      ...inspection,
+    if (!currentUrl.includes("/project/")) {
+      throw new Error(
+        "Claude Project did not open. Check CLAUDE_PROJECT_URL."
+      );
+    }
+
+    // Project Instructions are already saved in Claude.
+    // Ask Claude to execute only the first production stage.
+    const prompt = `
+Follow the permanent Project Instructions already configured
+in this Claude Project.
+
+NEW VIDEO TOPIC:
+${title}
+
+TASK:
+1. Research the topic and prepare the complete explainer plan.
+2. Follow the exact six-scene structure in the Project Instructions.
+3. Write the English voiceover script (approximately 120-140 words).
+4. Provide scene-by-scene visual concepts and voice direction.
+5. Put the complete voiceover in one copy-friendly code block.
+6. Do not create HTML, CSS, JavaScript, animation or render files yet.
+7. Stop after the script and wait for my approval.
+
+This is the script preparation stage only.
+Do not skip any permanent Project Instructions.
+`;
+
+    await submitPrompt(page, prompt);
+
+    console.log("Prompt submitted. Waiting for Claude...");
+
+    const responseText = await waitForClaudeResponse(page);
+
+    console.log("Claude response completed.");
+
+    return res.json({
+      success: true,
+      status: "SCRIPT_READY_FOR_REVIEW",
+      topic: title,
+      projectUrl: CLAUDE_PROJECT_URL,
       sessionId: session.id,
-      nextStep: inspection.projectOpened
-        ? "Project is ready for prompt automation"
-        : "Complete login and verify the saved Context"
-    };
+      scriptResponse: responseText,
+      nextStep: "Review the script before proceeding to audio and video production."
+    });
 
   } catch (error) {
     console.error("Automation error:", error);
 
-    responseData = {
+    return res.status(500).json({
       success: false,
-      message: "Browser automation failed",
-      error: error.message,
+      status: "FAILED",
+      message: error.message,
       sessionId: session?.id || null
-    };
+    });
 
   } finally {
-    // Release session after collecting page information.
-    // Persisted Context is intended to retain login state.
     if (session?.id) {
       await releaseSession(session.id);
     }
   }
-
-  const statusCode = responseData.success ? 200 : 500;
-
-  return res.status(statusCode).json(responseData);
 });
 
-// Open Claude manually for first-time login
+// Manual Claude login setup
 app.post("/setup-login", authenticate, async (req, res) => {
   let session;
 
   try {
-    session = await createBrowserSession();
+    session = await createSession();
 
     const browser = await chromium.connectOverCDP(
       session.connectUrl
     );
 
     const context = browser.contexts()[0];
-
-    const page =
-      context.pages()[0] || await context.newPage();
+    const page = context.pages()[0] || await context.newPage();
 
     await page.goto("https://claude.ai", {
-      waitUntil: "domcontentloaded",
-      timeout: 90000
+      waitUntil: "domcontentloaded"
     });
-
-    // Keep this session running for manual login.
-    // Release it using /stop-session after login.
 
     return res.json({
       success: true,
-      message: "Claude login browser opened",
       sessionId: session.id,
-      loginUrl: "https://claude.ai",
       sessionInspector:
         `https://browserbase.com/sessions/${session.id}`,
-      instruction:
-        "Open the session inspector, log in manually, then call /stop-session."
+      message: "Complete Claude login manually."
     });
 
   } catch (error) {
-    console.error("Login setup error:", error);
-
     if (session?.id) {
       await releaseSession(session.id);
     }
 
     return res.status(500).json({
       success: false,
-      message: "Could not open Claude login session",
       error: error.message
     });
   }
 });
 
-// Stop manual login session
+// Stop a manually opened session
 app.post("/stop-session", authenticate, async (req, res) => {
-  try {
-    const { sessionId } = req.body;
+  const { sessionId } = req.body;
 
-    if (!sessionId) {
-      return res.status(400).json({
-        success: false,
-        message: "sessionId is required"
-      });
-    }
-
-    await releaseSession(sessionId);
-
-    return res.json({
-      success: true,
-      message: "Session release requested",
-      sessionId
-    });
-
-  } catch (error) {
-    return res.status(500).json({
+  if (!sessionId) {
+    return res.status(400).json({
       success: false,
-      error: error.message
+      message: "sessionId is required"
     });
   }
+
+  await releaseSession(sessionId);
+
+  return res.json({
+    success: true,
+    message: "Session release requested"
+  });
 });
 
-// Start server
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Claude Browser Automation running on port ${PORT}`);
+  console.log(`Claude automation running on port ${PORT}`);
 });
