@@ -4,8 +4,6 @@ import Browserbase from "@browserbasehq/sdk";
 import { chromium } from "playwright-core";
 
 const app = express();
-
-// WAV Base64 payload support
 app.use(express.json({ limit: "35mb" }));
 
 const PORT = process.env.PORT || 3000;
@@ -18,7 +16,6 @@ const {
   CLAUDE_PROJECT_URL
 } = process.env;
 
-// Validate environment variables
 const required = {
   BROWSERBASE_API_KEY,
   BROWSERBASE_PROJECT_ID,
@@ -32,21 +29,14 @@ const missing = Object.entries(required)
   .map(([key]) => key);
 
 if (missing.length) {
-  throw new Error(
-    `Missing environment variables: ${missing.join(", ")}`
-  );
+  throw new Error(`Missing environment variables: ${missing.join(", ")}`);
 }
 
-const bb = new Browserbase({
-  apiKey: BROWSERBASE_API_KEY
-});
+const bb = new Browserbase({ apiKey: BROWSERBASE_API_KEY });
 
-// Authentication middleware
+// Authentication
 function authenticate(req, res, next) {
-  if (
-    req.headers.authorization !==
-    `Bearer ${AUTOMATION_API_KEY}`
-  ) {
+  if (req.headers.authorization !== `Bearer ${AUTOMATION_API_KEY}`) {
     return res.status(401).json({
       success: false,
       message: "Unauthorized"
@@ -71,7 +61,7 @@ async function createSession() {
   });
 }
 
-// Release Browserbase session
+// Release session
 async function releaseSession(sessionId) {
   if (!sessionId) return;
 
@@ -81,7 +71,7 @@ async function releaseSession(sessionId) {
       projectId: BROWSERBASE_PROJECT_ID
     });
   } catch (error) {
-    console.error("Session release error:", error.message);
+    console.error("Browserbase release error:", error.message);
   }
 }
 
@@ -94,30 +84,26 @@ async function openClaudeProject(page) {
 
   await page.waitForTimeout(7000);
 
-  const url = page.url();
+  const currentUrl = page.url();
 
   if (
-    url.includes("/login") ||
-    url.includes("/oauth")
+    currentUrl.includes("/login") ||
+    currentUrl.includes("/oauth")
   ) {
-    throw new Error(
-      "Claude login required. Re-authenticate Browserbase Context."
-    );
+    throw new Error("Claude login required. Run /setup-login.");
   }
 
-  if (!url.includes("/project/")) {
-    throw new Error(
-      `Claude Project did not open. Current URL: ${url}`
-    );
+  if (!currentUrl.includes("/project/")) {
+    throw new Error(`Claude Project did not open: ${currentUrl}`);
   }
 }
 
-// Find Claude chat input
+// Find Claude composer
 async function findComposer(page) {
   const selectors = [
     '[contenteditable="true"]',
-    "textarea",
-    '[role="textbox"]'
+    'div[role="textbox"]',
+    "textarea"
   ];
 
   for (const selector of selectors) {
@@ -133,12 +119,10 @@ async function findComposer(page) {
     } catch {}
   }
 
-  throw new Error(
-    "Claude chat input not found. Update composer selectors."
-  );
+  throw new Error("Claude message composer not found.");
 }
 
-// Submit prompt to Claude
+// Submit prompt
 async function submitPrompt(page, prompt) {
   const composer = await findComposer(page);
 
@@ -151,109 +135,215 @@ async function submitPrompt(page, prompt) {
     'button[aria-label*="Submit" i]'
   ];
 
-  let sent = false;
+  let submitted = false;
 
   for (const selector of selectors) {
     const button = page.locator(selector).last();
 
     try {
       if (
-        await button.count() &&
+        await button.count() > 0 &&
         await button.isVisible() &&
         await button.isEnabled()
       ) {
         await button.click();
-        sent = true;
+        submitted = true;
         break;
       }
     } catch {}
   }
 
-  if (!sent) {
+  if (!submitted) {
     await composer.press("Enter");
   }
 
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(2500);
 }
 
-// Get Claude response text
+// Get page text
 async function getMainText(page) {
   const main = page.locator("main").last();
 
-  if (await main.count()) {
+  if (await main.count() > 0) {
     return (await main.innerText()).trim();
   }
 
   return (await page.locator("body").innerText()).trim();
 }
 
-// Wait for Claude response
-async function waitForClaudeResponse(
-  page,
-  timeoutMs = 900000
-) {
-  const started = Date.now();
+// Check if Claude is generating
+async function isClaudeGenerating(page) {
+  const selectors = [
+    'button[aria-label*="Stop" i]',
+    'button[title*="Stop" i]'
+  ];
 
-  let previous = "";
-  let stableSince = 0;
-  let lastText = "";
-
-  while (Date.now() - started < timeoutMs) {
-    await page.waitForTimeout(2500);
-
-    const current = await getMainText(page);
-
-    const stop = page.locator(
-      'button[aria-label*="Stop" i], button[title*="Stop" i]'
-    ).last();
-
-    let generating = false;
+  for (const selector of selectors) {
+    const button = page.locator(selector).last();
 
     try {
-      generating =
-        await stop.count() > 0 &&
-        await stop.isVisible();
+      if (
+        await button.count() > 0 &&
+        await button.isVisible()
+      ) {
+        return true;
+      }
     } catch {}
+  }
 
-    if (current.length > 500) {
-      lastText = current;
+  return false;
+}
 
-      if (current === previous && !generating) {
-        if (!stableSince) {
-          stableSince = Date.now();
-        }
+// Count marker occurrences
+function countOccurrences(text, marker) {
+  return text.split(marker).length - 1;
+}
 
-        if (Date.now() - stableSince >= 12000) {
-          return lastText;
+// Extract narration between markers
+function extractMarkedVoiceover(text) {
+  const startMarker = "VOICEOVER_START";
+  const endMarker = "VOICEOVER_END";
+
+  const startIndex = text.lastIndexOf(startMarker);
+  const endIndex = text.lastIndexOf(endMarker);
+
+  if (
+    startIndex === -1 ||
+    endIndex === -1 ||
+    endIndex <= startIndex
+  ) {
+    return "";
+  }
+
+  return text
+    .slice(startIndex + startMarker.length, endIndex)
+    .replace(/```[a-z]*\s*/gi, "")
+    .replace(/```/g, "")
+    .trim();
+}
+
+// Word count
+function countWords(text) {
+  return String(text || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+}
+
+// Wait for a NEW Claude script response
+async function waitForMarkedScript(page, timeoutMs = 900000) {
+  const startedAt = Date.now();
+
+  let previousVoiceover = "";
+  let stableSince = 0;
+  let latestPageText = "";
+
+  while (Date.now() - startedAt < timeoutMs) {
+    await page.waitForTimeout(2500);
+
+    latestPageText = await getMainText(page);
+
+    const startCount = countOccurrences(
+      latestPageText,
+      "VOICEOVER_START"
+    );
+
+    const endCount = countOccurrences(
+      latestPageText,
+      "VOICEOVER_END"
+    );
+
+    // Prompt contains one marker pair.
+    // Claude's answer must add another pair.
+    if (startCount >= 2 && endCount >= 2) {
+      const voiceover = extractMarkedVoiceover(latestPageText);
+      const words = countWords(voiceover);
+      const generating = await isClaudeGenerating(page);
+
+      if (words >= 80 && !generating) {
+        if (voiceover === previousVoiceover) {
+          if (!stableSince) {
+            stableSince = Date.now();
+          }
+
+          if (Date.now() - stableSince >= 8000) {
+            return {
+              pageText: latestPageText,
+              voiceover,
+              wordCount: words
+            };
+          }
+        } else {
+          previousVoiceover = voiceover;
+          stableSince = 0;
         }
       } else {
         stableSince = 0;
       }
     }
-
-    previous = current;
   }
 
+  const foundVoiceover = extractMarkedVoiceover(latestPageText);
+  const foundWords = countWords(foundVoiceover);
+
   throw new Error(
-    "Claude response timed out. Inspect Browserbase session."
+    `Claude did not return a complete new voiceover. ` +
+    `Detected ${foundWords} words. Check Claude response.`
   );
 }
 
-// Safe audio filename
-function safeFilename(value) {
-  const name = String(value || "explainer")
+// Wait for new render response
+async function waitForStableNewResponse(
+  page,
+  baselineText,
+  timeoutMs = 1800000
+) {
+  const startedAt = Date.now();
+
+  let previousText = "";
+  let stableSince = 0;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    await page.waitForTimeout(3000);
+
+    const currentText = await getMainText(page);
+
+    const hasNewContent =
+      currentText.length > baselineText.length &&
+      currentText !== baselineText;
+
+    if (!hasNewContent) continue;
+
+    const generating = await isClaudeGenerating(page);
+
+    if (!generating && currentText === previousText) {
+      if (!stableSince) stableSince = Date.now();
+
+      if (Date.now() - stableSince >= 12000) {
+        return currentText;
+      }
+    } else {
+      stableSince = 0;
+    }
+
+    previousText = currentText;
+  }
+
+  throw new Error("Claude render response timed out.");
+}
+
+// Filename helper
+function safeBaseName(value) {
+  return String(value || "explainer")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "")
-    .slice(0, 70);
-
-  return `${name || "explainer"}-voice.wav`;
+    .slice(0, 70) || "explainer";
 }
 
-// Extract MP4 URL from response
+// Extract MP4 URL
 function extractMp4Url(text) {
-  const urls =
-    text.match(/https?:\/\/[^\s<>"')]+/g) || [];
+  const urls = text.match(/https?:\/\/[^\s<>"')]+/g) || [];
 
   return urls
     .map(url => url.replace(/[.,;]+$/, ""))
@@ -267,17 +357,18 @@ app.get("/health", (req, res) => {
     service: "Claude Explainer Automation",
     status: "online",
     endpoints: [
-      "/run",
-      "/render",
-      "/setup-login",
-      "/stop-session"
+      "GET /health",
+      "POST /run",
+      "POST /render",
+      "POST /setup-login",
+      "POST /stop-session"
     ]
   });
 });
 
-// ==========================================
+// ================================================
 // STAGE 1: GENERATE SCRIPT
-// ==========================================
+// ================================================
 
 app.post("/run", authenticate, async (req, res) => {
   let session;
@@ -288,11 +379,11 @@ app.post("/run", authenticate, async (req, res) => {
     if (!title) {
       return res.status(400).json({
         success: false,
-        message: "Topic title is required"
+        message: "Topic title is required."
       });
     }
 
-    console.log("Generating script:", title);
+    console.log("Starting script generation:", title);
 
     session = await createSession();
 
@@ -301,65 +392,76 @@ app.post("/run", authenticate, async (req, res) => {
     );
 
     const context = browser.contexts()[0];
-
-    const page =
-      context.pages()[0] ||
-      await context.newPage();
+    const page = context.pages()[0] || await context.newPage();
 
     await openClaudeProject(page);
 
     const prompt = `
-Follow the permanent Project Instructions.
+Follow the permanent Project Instructions already configured
+in this Claude Project.
 
 VIDEO TOPIC:
 ${title}
 
-Create the complete six-scene explainer script.
+Create a complete one-minute explainer following the exact
+six-scene structure in the permanent Project Instructions.
 
-IMPORTANT OUTPUT FORMAT:
+SCRIPT REQUIREMENTS:
+- Write the spoken narration in English.
+- Aim for approximately 120-180 words.
+- Make it natural, accurate, engaging and suitable for voice narration.
+- Do not put scene directions, production instructions or headings
+  inside the spoken narration.
+- Do not include the words "VOICEOVER_START" or "VOICEOVER_END"
+  anywhere inside the narration itself.
 
-Return the actual spoken narration exactly
-between these two markers:
+MANDATORY OUTPUT FORMAT:
 
 VOICEOVER_START
-
-[Write the complete English narration here.
-Approximately 120-140 words.]
-
+[Write ONLY the complete spoken narration here.]
 VOICEOVER_END
 
-After that provide:
-- Six scene descriptions
-- Visual direction
-- On-screen text
-- Social media caption
+After the closing marker, provide:
+1. Six scene descriptions.
+2. Visual direction for each scene.
+3. On-screen text for each scene.
+4. A short social media caption.
 
-Do not put instructions inside the voiceover.
-Do not include scene descriptions inside the voiceover.
-Do not generate HTML or video yet.
+IMPORTANT:
+- The two markers must each appear exactly once in your answer.
+- Do not repeat the markers in explanations or code blocks.
+- Do not create HTML, CSS, JavaScript or animation yet.
+- Do not render a video in this stage.
+- Do not ask for approval or ask questions.
+- Finish the complete script before responding.
 `;
 
     await submitPrompt(page, prompt);
 
-    console.log("Waiting for Claude script...");
+    console.log("Waiting for Claude's new narration...");
 
-    const scriptResponse =
-      await waitForClaudeResponse(page);
+    const result = await waitForMarkedScript(page);
+
+    console.log(
+      `Script ready. Word count: ${result.wordCount}`
+    );
 
     return res.json({
       success: true,
       status: "SCRIPT_READY",
       topic: title,
       projectUrl: CLAUDE_PROJECT_URL,
-      scriptResponse
+      voiceover: result.voiceover,
+      wordCount: result.wordCount,
+      scriptResponse: result.pageText
     });
 
   } catch (error) {
-    console.error("Script error:", error);
+    console.error("Script generation error:", error);
 
     return res.status(500).json({
       success: false,
-      status: "FAILED",
+      status: "SCRIPT_FAILED",
       message: error.message,
       sessionId: session?.id || null
     });
@@ -371,47 +473,36 @@ Do not generate HTML or video yet.
   }
 });
 
-// ==========================================
+// ================================================
 // STAGE 2: UPLOAD WAV + RENDER VIDEO
-// ==========================================
+// ================================================
 
 app.post("/render", authenticate, async (req, res) => {
   let session;
 
   try {
     const title = String(req.body.title || "").trim();
-
-    const voiceover =
-      String(req.body.voiceover || "").trim();
-
-    const script =
-      String(req.body.script || "").trim();
-
-    const audioBase64 =
-      String(req.body.audioBase64 || "").trim();
+    const voiceover = String(req.body.voiceover || "").trim();
+    const script = String(req.body.script || "").trim();
+    const audioBase64 = String(req.body.audioBase64 || "").trim();
 
     if (!title || !voiceover || !audioBase64) {
       return res.status(400).json({
         success: false,
-        message:
-          "title, voiceover and audioBase64 are required"
+        message: "title, voiceover and audioBase64 are required."
       });
     }
 
     if (!/^[A-Za-z0-9+/=\s]+$/.test(audioBase64)) {
       return res.status(400).json({
         success: false,
-        message: "Invalid Base64 audio data"
+        message: "Invalid Base64 audio data."
       });
     }
 
-    // Convert Base64 to WAV buffer
-    const audioBuffer = Buffer.from(
-      audioBase64,
-      "base64"
-    );
+    const audioBuffer = Buffer.from(audioBase64, "base64");
 
-    // Validate WAV header
+    // Validate WAV
     if (
       audioBuffer.length < 1000 ||
       audioBuffer.subarray(0, 4).toString() !== "RIFF" ||
@@ -419,19 +510,30 @@ app.post("/render", authenticate, async (req, res) => {
     ) {
       return res.status(400).json({
         success: false,
-        message: "Invalid WAV file"
+        message: "The supplied audio is not a valid WAV file."
       });
     }
 
-    const filename = safeFilename(
-      req.body.audioFileName || title
+    // 20 MB maximum
+    const maxAudioBytes = 20 * 1024 * 1024;
+
+    if (audioBuffer.length > maxAudioBytes) {
+      return res.status(413).json({
+        success: false,
+        message: "WAV file is larger than the 20 MB limit."
+      });
+    }
+
+    const baseName = safeBaseName(title);
+
+    const audioFileName = String(
+      req.body.audioFileName || `${baseName}-voice.wav`
     );
 
     console.log(
-      `Rendering: ${title}, Audio size: ${audioBuffer.length}`
+      `Starting render: ${title}; WAV bytes: ${audioBuffer.length}`
     );
 
-    // Start Browserbase
     session = await createSession();
 
     const browser = await chromium.connectOverCDP(
@@ -439,16 +541,12 @@ app.post("/render", authenticate, async (req, res) => {
     );
 
     const context = browser.contexts()[0];
-
-    const page =
-      context.pages()[0] ||
-      await context.newPage();
+    const page = context.pages()[0] || await context.newPage();
 
     await openClaudeProject(page);
 
-    // Find Claude file input
-    let fileInput =
-      page.locator('input[type="file"]').last();
+    // Locate Claude file input
+    let fileInput = page.locator('input[type="file"]').last();
 
     try {
       await fileInput.waitFor({
@@ -463,22 +561,30 @@ app.post("/render", authenticate, async (req, res) => {
         'button[title*="Attach" i]'
       ];
 
+      let clicked = false;
+
       for (const selector of attachSelectors) {
         const button = page.locator(selector).last();
 
         try {
           if (
-            await button.count() &&
+            await button.count() > 0 &&
             await button.isVisible()
           ) {
             await button.click();
+            clicked = true;
             break;
           }
         } catch {}
       }
 
-      fileInput =
-        page.locator('input[type="file"]').last();
+      if (!clicked) {
+        throw new Error(
+          "Claude attachment button was not found."
+        );
+      }
+
+      fileInput = page.locator('input[type="file"]').last();
 
       await fileInput.waitFor({
         state: "attached",
@@ -486,95 +592,85 @@ app.post("/render", authenticate, async (req, res) => {
       });
     }
 
-    // Upload WAV to Claude
+    // Upload WAV
     await fileInput.setInputFiles({
-      name: filename,
+      name: audioFileName,
       mimeType: "audio/wav",
       buffer: audioBuffer
     });
 
-    console.log("WAV uploaded to Claude.");
+    console.log("WAV attached to Claude.");
 
     await page.waitForTimeout(8000);
 
-    // Automatic video rendering prompt
-    const prompt = `
+    const baselineText = await getMainText(page);
+
+    const renderPrompt = `
 Continue production for this explainer video.
 
-TOPIC:
+VIDEO TOPIC:
 ${title}
 
-VOICEOVER:
+FINAL VOICEOVER:
 ${voiceover}
 
-FULL SCRIPT AND SCENE PLAN:
-${script || "Use the existing six-scene plan."}
+FULL SCRIPT AND SIX-SCENE PLAN:
+${script || "Use the six-scene plan from this project conversation."}
 
-IMPORTANT AUDIO INSTRUCTION:
+A WAV narration file has been attached.
 
-I have attached the final narration as a WAV file.
+AUDIO REQUIREMENTS:
+- Use the exact attached WAV file as narration.
+- Do not generate a replacement voice.
+- Do not rewrite the spoken words.
+- Synchronize visuals and captions to this audio.
 
-Use this exact uploaded audio as the narration track.
-
-Do not generate another voiceover.
-Do not change the spoken words.
-
-TASK:
-
-1. Follow permanent Project Instructions.
+PRODUCTION TASK:
+1. Follow the permanent Project Instructions.
 2. Create the complete six-scene explainer.
-3. Build HTML, CSS and JavaScript animation.
-4. Synchronize scenes with supplied narration.
+3. Build the required HTML, CSS and JavaScript animation.
+4. Synchronize scenes with the narration.
 5. Add captions and on-screen text.
-6. Render the complete video.
-7. Export the final video as MP4.
-8. Do not ask for approval.
-9. Do not stop for confirmation.
+6. Render/export the final video as MP4.
+7. Do not ask for approval or confirmation.
+8. Complete the production task.
 
-Return the final MP4 download URL if available.
-Also return the social media caption.
-
-If Claude creates a downloadable artifact instead
-of a direct URL, clearly identify that artifact.
+Return:
+- Direct downloadable MP4 URL if available.
+- Final social media caption.
+- If a downloadable artifact is created instead,
+  identify its name and explain how it can be downloaded.
 `;
 
-    await submitPrompt(page, prompt);
+    await submitPrompt(page, renderPrompt);
 
-    console.log("Claude video rendering started...");
+    console.log("Waiting for Claude video render...");
 
-    const renderResponse =
-      await waitForClaudeResponse(
-        page,
-        1800000
-      );
+    const renderResponse = await waitForStableNewResponse(
+      page,
+      baselineText,
+      1800000
+    );
 
-    const videoUrl =
-      extractMp4Url(renderResponse);
+    const videoUrl = extractMp4Url(renderResponse);
 
     return res.json({
       success: true,
-
       status: videoUrl
         ? "VIDEO_URL_RETURNED"
         : "RENDER_RESPONSE_READY",
-
       topic: title,
-
       video_url: videoUrl,
-
       caption: String(req.body.caption || ""),
-
       renderResponse,
-
       sessionId: session.id,
-
       note: videoUrl
         ? "MP4 URL detected."
-        : "Claude responded, but no direct MP4 URL was detected. Inspect renderResponse."
+        : "No direct MP4 URL detected. Inspect renderResponse for a downloadable artifact."
     });
 
   } catch (error) {
-    console.error("Render error:", error);
+    console.error("Video render error:", error);
 
     return res.status(500).json({
       success: false,
@@ -590,9 +686,9 @@ of a direct URL, clearly identify that artifact.
   }
 });
 
-// ==========================================
-// MANUAL CLAUDE LOGIN SETUP
-// ==========================================
+// ================================================
+// MANUAL CLAUDE LOGIN
+// ================================================
 
 app.post("/setup-login", authenticate, async (req, res) => {
   let session;
@@ -605,10 +701,7 @@ app.post("/setup-login", authenticate, async (req, res) => {
     );
 
     const context = browser.contexts()[0];
-
-    const page =
-      context.pages()[0] ||
-      await context.newPage();
+    const page = context.pages()[0] || await context.newPage();
 
     await page.goto("https://claude.ai", {
       waitUntil: "domcontentloaded",
@@ -618,10 +711,8 @@ app.post("/setup-login", authenticate, async (req, res) => {
     return res.json({
       success: true,
       sessionId: session.id,
-
       sessionInspector:
         `https://browserbase.com/sessions/${session.id}`,
-
       message: "Complete Claude login manually."
     });
 
@@ -637,9 +728,9 @@ app.post("/setup-login", authenticate, async (req, res) => {
   }
 });
 
-// ==========================================
-// STOP SESSION
-// ==========================================
+// ================================================
+// RELEASE MANUAL SESSION
+// ================================================
 
 app.post("/stop-session", authenticate, async (req, res) => {
   const { sessionId } = req.body;
@@ -647,7 +738,7 @@ app.post("/stop-session", authenticate, async (req, res) => {
   if (!sessionId) {
     return res.status(400).json({
       success: false,
-      message: "sessionId is required"
+      message: "sessionId is required."
     });
   }
 
@@ -655,16 +746,13 @@ app.post("/stop-session", authenticate, async (req, res) => {
 
   return res.json({
     success: true,
-    message: "Session release requested"
+    message: "Session release requested."
   });
 });
 
-// ==========================================
-// START SERVER
-// ==========================================
-
+// Start server
 app.listen(PORT, "0.0.0.0", () => {
   console.log(
-    `Claude automation running on port ${PORT}`
+    `Claude Explainer Automation running on port ${PORT}`
   );
 });
