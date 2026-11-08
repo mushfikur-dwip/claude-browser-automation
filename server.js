@@ -3,6 +3,14 @@ import express from "express";
 import Browserbase from "@browserbasehq/sdk";
 import { chromium } from "playwright-core";
 
+import fs from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
+import { spawn } from "node:child_process";
+import ffmpegStatic from "ffmpeg-static";
+import ffprobeStatic from "ffprobe-static";
+
+
 const app = express();
 app.use(express.json({ limit: "35mb" }));
 
@@ -755,4 +763,531 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(
     `Claude Explainer Automation running on port ${PORT}`
   );
+});
+
+
+const FFMPEG_PATH = ffmpegStatic;
+const FFPROBE_PATH = ffprobeStatic.path;
+
+if (!FFMPEG_PATH || !FFPROBE_PATH) {
+  throw new Error("FFmpeg/FFprobe binary not found.");
+}
+
+// Execute FFmpeg / FFprobe
+function runCommand(command, args, timeout = 600000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("FFmpeg process timed out."));
+    }, timeout);
+
+    child.stdout.on("data", data => {
+      stdout += data.toString();
+    });
+
+    child.stderr.on("data", data => {
+      stderr += data.toString();
+    });
+
+    child.on("error", error => {
+      clearTimeout(timer);
+      reject(error);
+    });
+
+    child.on("close", code => {
+      clearTimeout(timer);
+
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        reject(
+          new Error(
+            `Command failed: ${stderr.slice(-4000)}`
+          )
+        );
+      }
+    });
+  });
+}
+
+// Get audio duration
+async function getAudioDuration(filePath) {
+  const { stdout } = await runCommand(FFPROBE_PATH, [
+    "-v", "error",
+    "-show_entries", "format=duration",
+    "-of", "default=noprint_wrappers=1:nokey=1",
+    filePath
+  ]);
+
+  const duration = Number(stdout.trim());
+
+  if (!Number.isFinite(duration) || duration <= 0) {
+    throw new Error("Unable to detect audio duration.");
+  }
+
+  return duration;
+}
+
+// Download scene image
+async function downloadSceneImage(url, destination) {
+  const parsed = new URL(url);
+
+  if (parsed.protocol !== "https:") {
+    throw new Error("Only HTTPS image URLs are allowed.");
+  }
+
+  const response = await fetch(url, {
+    signal: AbortSignal.timeout(30000)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Image download failed: ${response.status}`);
+  }
+
+  const contentType = response.headers.get("content-type") || "";
+
+  if (!contentType.startsWith("image/")) {
+    throw new Error("Scene URL did not return an image.");
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+
+  if (buffer.length > 15 * 1024 * 1024) {
+    throw new Error("Scene image exceeds 15 MB.");
+  }
+
+  await fs.writeFile(destination, buffer);
+}
+
+// Validate SRT format
+function validateSrt(srt) {
+  if (typeof srt !== "string" || !srt.trim()) {
+    throw new Error("Claude SRT subtitle is missing.");
+  }
+
+  const blocks = srt.trim().replace(/\r/g, "").split(/\n\s*\n/);
+
+  if (!blocks.length) {
+    throw new Error("Invalid SRT file.");
+  }
+
+  const timePattern =
+    /^(\d{2}:\d{2}:\d{2},\d{3})\s+-->\s+(\d{2}:\d{2}:\d{2},\d{3})$/;
+
+  const toSeconds = timestamp => {
+    const match = timestamp.match(
+      /^(\d{2}):(\d{2}):(\d{2}),(\d{3})$/
+    );
+
+    if (!match) return NaN;
+
+    return (
+      Number(match[1]) * 3600 +
+      Number(match[2]) * 60 +
+      Number(match[3]) +
+      Number(match[4]) / 1000
+    );
+  };
+
+  let previousEnd = 0;
+
+  for (const block of blocks) {
+    const lines = block.trim().split("\n");
+
+    if (lines.length < 3) {
+      throw new Error("Invalid SRT subtitle block.");
+    }
+
+    const timeMatch = lines[1].match(timePattern);
+
+    if (!timeMatch) {
+      throw new Error("Invalid SRT timestamp: " + lines[1]);
+    }
+
+    const start = toSeconds(timeMatch[1]);
+    const end = toSeconds(timeMatch[2]);
+
+    if (
+      !Number.isFinite(start) ||
+      !Number.isFinite(end) ||
+      end <= start ||
+      start < previousEnd
+    ) {
+      throw new Error("Invalid or overlapping SRT timestamps.");
+    }
+
+    previousEnd = end;
+  }
+
+  return blocks.length;
+}
+
+// Generate scene video
+async function renderScene(imagePath, outputPath, duration) {
+  const frames = Math.max(1, Math.ceil(duration * 30));
+
+  const filter = [
+    "scale=1080:1920:force_original_aspect_ratio=increase",
+    "crop=1080:1920",
+    "zoompan=z='min(zoom+0.0004,1.08)':d=1:s=1080x1920:fps=30",
+    "setsar=1",
+    "format=yuv420p"
+  ].join(",");
+
+  await runCommand(FFMPEG_PATH, [
+    "-y",
+    "-loop", "1",
+    "-framerate", "30",
+    "-i", imagePath,
+    "-t", duration.toFixed(3),
+    "-vf", filter,
+    "-frames:v", String(frames),
+    "-an",
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-crf", "23",
+    "-pix_fmt", "yuv420p",
+    "-r", "30",
+    outputPath
+  ], 300000);
+}
+
+// Burn Claude SRT into video
+async function burnSubtitles(
+  inputVideo,
+  subtitlePath,
+  outputVideo
+) {
+  const escapedPath = subtitlePath
+    .replace(/\\/g, "/")
+    .replace(/:/g, "\\:")
+    .replace(/'/g, "\\'");
+
+  const subtitleFilter =
+    `subtitles='${escapedPath}':` +
+    "force_style='FontName=DejaVu Sans," +
+    "FontSize=20," +
+    "Bold=1," +
+    "PrimaryColour=&H00FFFFFF," +
+    "OutlineColour=&H00000000," +
+    "BorderStyle=1," +
+    "Outline=3," +
+    "Shadow=1," +
+    "Alignment=2," +
+    "MarginV=230'";
+
+  await runCommand(FFMPEG_PATH, [
+    "-y",
+    "-i", inputVideo,
+    "-vf", subtitleFilter,
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-crf", "22",
+    "-pix_fmt", "yuv420p",
+    "-an",
+    outputVideo
+  ], 600000);
+}
+
+// ==========================================
+// RENDER ENDPOINT
+// ==========================================
+
+app.post("/render", authenticate, async (req, res) => {
+  let workDir;
+
+  try {
+    const {
+      title,
+      audioBase64,
+      subtitleSrt,
+      scenes
+    } = req.body;
+
+    if (
+      !title ||
+      !audioBase64 ||
+      !subtitleSrt ||
+      !Array.isArray(scenes)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "title, audioBase64, subtitleSrt and scenes are required."
+      });
+    }
+
+    if (scenes.length !== 6) {
+      return res.status(400).json({
+        success: false,
+        message: "Exactly 6 scene images are required."
+      });
+    }
+
+    if (
+      !/^[A-Za-z0-9+/=\s]+$/.test(audioBase64)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid audioBase64."
+      });
+    }
+
+    // Decode Gemini WAV
+    const audioBuffer = Buffer.from(audioBase64, "base64");
+
+    const maxAudioSize = 20 * 1024 * 1024;
+
+    if (
+      audioBuffer.length < 1000 ||
+      audioBuffer.length > maxAudioSize ||
+      audioBuffer.subarray(0, 4).toString() !== "RIFF" ||
+      audioBuffer.subarray(8, 12).toString() !== "WAVE"
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid WAV file or file exceeds 20 MB."
+      });
+    }
+
+    // Validate Claude SRT
+    const subtitleCount = validateSrt(subtitleSrt);
+
+    // Validate scene image URLs
+    for (const scene of scenes) {
+      if (!scene.imageUrl) {
+        return res.status(400).json({
+          success: false,
+          message: "Every scene needs an imageUrl."
+        });
+      }
+    }
+
+    console.log("Starting video render:", title);
+
+    workDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "ant-video-")
+    );
+
+    // Save Gemini audio
+    const audioPath = path.join(
+      workDir,
+      "voiceover.wav"
+    );
+
+    await fs.writeFile(audioPath, audioBuffer);
+
+    // Audio is the master timeline
+    const audioDuration = await getAudioDuration(audioPath);
+
+    console.log("Audio duration:", audioDuration);
+
+    // Save Claude subtitles
+    const subtitlePath = path.join(
+      workDir,
+      "subtitles.srt"
+    );
+
+    await fs.writeFile(
+      subtitlePath,
+      subtitleSrt,
+      "utf8"
+    );
+
+    // Allocate scene durations by weights
+    const weights = scenes.map(scene => {
+      const value = Number(scene.duration);
+
+      return Number.isFinite(value) && value > 0
+        ? value
+        : 1;
+    });
+
+    const totalWeight = weights.reduce(
+      (sum, value) => sum + value,
+      0
+    );
+
+    const durations = weights.map(
+      value => audioDuration * value / totalWeight
+    );
+
+    const clips = [];
+
+    // Download and render six scenes
+    for (let i = 0; i < scenes.length; i++) {
+      const imagePath = path.join(
+        workDir,
+        `scene-${i + 1}.jpg`
+      );
+
+      const clipPath = path.join(
+        workDir,
+        `scene-${i + 1}.mp4`
+      );
+
+      console.log(`Processing scene ${i + 1}/6`);
+
+      await downloadSceneImage(
+        scenes[i].imageUrl,
+        imagePath
+      );
+
+      await renderScene(
+        imagePath,
+        clipPath,
+        durations[i]
+      );
+
+      clips.push(clipPath);
+    }
+
+    // Concat scene clips
+    const concatPath = path.join(
+      workDir,
+      "concat.txt"
+    );
+
+    const concatContent = clips
+      .map(file => `file '${file}'`)
+      .join("\n");
+
+    await fs.writeFile(
+      concatPath,
+      concatContent,
+      "utf8"
+    );
+
+    const joinedVideo = path.join(
+      workDir,
+      "joined.mp4"
+    );
+
+    await runCommand(FFMPEG_PATH, [
+      "-y",
+      "-f", "concat",
+      "-safe", "0",
+      "-i", concatPath,
+      "-c", "copy",
+      joinedVideo
+    ], 300000);
+
+    // Burn Claude's subtitles
+    const subtitledVideo = path.join(
+      workDir,
+      "subtitled.mp4"
+    );
+
+    await burnSubtitles(
+      joinedVideo,
+      subtitlePath,
+      subtitledVideo
+    );
+
+    // Final MP4 with original Gemini WAV
+    const outputPath = path.join(
+      workDir,
+      "final-video.mp4"
+    );
+
+    console.log("Adding original Gemini voiceover...");
+
+    await runCommand(FFMPEG_PATH, [
+      "-y",
+      "-i", subtitledVideo,
+      "-i", audioPath,
+
+      "-map", "0:v:0",
+      "-map", "1:a:0",
+
+      "-c:v", "copy",
+      "-c:a", "aac",
+      "-b:a", "192k",
+
+      "-t", audioDuration.toFixed(3),
+      "-shortest",
+      "-movflags", "+faststart",
+
+      outputPath
+    ], 600000);
+
+    const stat = await fs.stat(outputPath);
+
+    if (stat.size < 10000) {
+      throw new Error("Final MP4 file is unexpectedly small.");
+    }
+
+    const safeTitle = String(title)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "")
+      .slice(0, 70) || "explainer";
+
+    const filename = `${safeTitle}.mp4`;
+
+    console.log("Video render completed:", filename);
+
+    // Send MP4 binary to n8n
+    res.setHeader("Content-Type", "video/mp4");
+
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${filename}"`
+    );
+
+    res.setHeader(
+      "Content-Length",
+      String(stat.size)
+    );
+
+    res.setHeader(
+      "X-Video-Duration",
+      audioDuration.toFixed(3)
+    );
+
+    res.setHeader(
+      "X-Subtitle-Count",
+      String(subtitleCount)
+    );
+
+    res.download(outputPath, filename, async error => {
+      if (error) {
+        console.error("Video download response error:", error.message);
+      }
+
+      try {
+        await fs.rm(workDir, {
+          recursive: true,
+          force: true
+        });
+      } catch {}
+    });
+
+  } catch (error) {
+    console.error("FFmpeg render error:", error);
+
+    if (workDir) {
+      try {
+        await fs.rm(workDir, {
+          recursive: true,
+          force: true
+        });
+      } catch {}
+    }
+
+    if (!res.headersSent) {
+      return res.status(500).json({
+        success: false,
+        status: "RENDER_FAILED",
+        message: error.message
+      });
+    }
+  }
 });
