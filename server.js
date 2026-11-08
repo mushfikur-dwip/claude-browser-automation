@@ -309,26 +309,34 @@ app.post("/run", authenticate, async (req, res) => {
     await openClaudeProject(page);
 
     const prompt = `
-Follow the permanent Project Instructions
-in this Claude Project.
+Follow the permanent Project Instructions.
 
 VIDEO TOPIC:
 ${title}
 
-TASK:
+Create the complete six-scene explainer script.
 
-1. Research the topic.
-2. Follow the exact six-scene structure.
-3. Write an English voiceover script of 120-140 words.
-4. Clearly place narration under the heading VOICEOVER.
-5. Include scene-by-scene visual concepts.
-6. Include on-screen text.
-7. Include a short social media caption.
-8. Do not create HTML, CSS or JavaScript yet.
-9. Do not render video yet.
+IMPORTANT OUTPUT FORMAT:
 
-Return the complete script.
-Stop after script generation.
+Return the actual spoken narration exactly
+between these two markers:
+
+VOICEOVER_START
+
+[Write the complete English narration here.
+Approximately 120-140 words.]
+
+VOICEOVER_END
+
+After that provide:
+- Six scene descriptions
+- Visual direction
+- On-screen text
+- Social media caption
+
+Do not put instructions inside the voiceover.
+Do not include scene descriptions inside the voiceover.
+Do not generate HTML or video yet.
 `;
 
     await submitPrompt(page, prompt);
